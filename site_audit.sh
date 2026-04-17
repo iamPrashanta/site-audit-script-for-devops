@@ -207,8 +207,18 @@ curl -s "https://crt.sh/?q=%25.$DOMAIN&output=json" |
 jq -r '.[].name_value' |
 tr '\n' ',' | tr ',' '\n' |
 sed 's/\*\.//' |
-grep -E "\.${DOMAIN}$" |
 sort -u >"$SUB/all.txt"
+
+# Ensure root domain is always included
+echo "$DOMAIN" >> "$SUB/all.txt"
+
+# Remove empty lines + deduplicate again
+grep -E "^[a-zA-Z0-9.-]+$" "$SUB/all.txt" | sort -u > "$SUB/tmp.txt"
+mv "$SUB/tmp.txt" "$SUB/all.txt"
+
+if [[ ! -s "$SUB/all.txt" ]]; then
+  echo "$DOMAIN" > "$SUB/all.txt"
+fi
 
 # RESOLVE SUBDOMAINS
 progress_bar "Resolving hosts"
