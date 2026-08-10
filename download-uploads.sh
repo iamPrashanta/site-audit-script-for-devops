@@ -6,8 +6,8 @@ set -Eeuo pipefail
 # CONFIG
 # ============================================================
 
-BASE_URL="https://genlabs.st/wp-content/uploads/"
-OUTPUT_DIR="./genlabs-uploads"
+BASE_URL="https://lab.abcd/wp-content/uploads/"
+OUTPUT_DIR="./lab-uploads"
 
 # Network behaviour
 WAIT_SECONDS=1
