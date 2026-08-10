@@ -7,48 +7,80 @@ set -euo pipefail
 ########################################
 
 DOMAIN=""
+
 ENABLE_PORT_SCAN=false
 ENABLE_NUCLEI=true
 
 THREADS=20
 WORDLIST="/usr/share/wordlists/subdomains.txt"
 
-# WPScan API token can be supplied through environment:
-# export WPSCAN_API_TOKEN="..."
-WPSCAN_API_TOKEN="${WPSCAN_API_TOKEN:-}"
-
-# Do not crawl huge amounts of content.
 MAX_BODY_SIZE="5M"
+CURL_TIMEOUT=15
+
+# Optional manually-created PHP canary.
+#
+# Example:
+#   ./wordpress-audit.sh genlabs.st \
+#       --php-canary-url /wp-content/uploads/security-canary.php
+#
+# IMPORTANT:
+# The scanner NEVER uploads this file.
+# You deliberately place the harmless canary yourself.
+PHP_CANARY_URL=""
 
 ########################################
-# ARG PARSE
+# USAGE
 ########################################
 
 usage() {
     cat <<EOF
 
+WordPress Security Audit
+
 Usage:
   $0 <domain> [options]
 
-Example:
-  $0 genlabs.st
-
 Options:
-  --ports        Run nmap top-1000 port scan
-  --no-nuclei    Disable nuclei
-  --wordlist     Subdomain wordlist
+
+  --ports
+      Run nmap top-1000 TCP port scan.
+
+  --no-nuclei
+      Disable Nuclei.
+
+  --wordlist <file>
+      Subdomain wordlist.
+
+  --php-canary-url <path>
+      Test a manually-created harmless PHP canary.
+
+      Example:
+        --php-canary-url /wp-content/uploads/security-canary.php
+
+      The scanner DOES NOT upload the file.
 
 Examples:
+
   $0 genlabs.st
+
   $0 genlabs.st --ports
+
   $0 genlabs.st --no-nuclei
-  $0 genlabs.st --wordlist /path/to/wordlist
+
+  $0 genlabs.st \
+      --php-canary-url /wp-content/uploads/security-canary.php
 
 EOF
 }
 
+########################################
+# ARGUMENT PARSING
+########################################
+
 while [[ "$#" -gt 0 ]]; do
+
     case "$1" in
+
         --ports)
             ENABLE_PORT_SCAN=true
             shift
@@ -60,12 +92,24 @@ while [[ "$#" -gt 0 ]]; do
             ;;
 
         --wordlist)
+
             [[ $# -ge 2 ]] || {
                 echo "Missing value for --wordlist"
                 exit 1
             }
 
             WORDLIST="$2"
+            shift 2
+            ;;
+
+        --php-canary-url)
+
+            [[ $# -ge 2 ]] || {
+                echo "Missing value for --php-canary-url"
+                exit 1
+            }
+
+            PHP_CANARY_URL="$2"
             shift 2
             ;;
 
@@ -91,6 +135,7 @@ while [[ "$#" -gt 0 ]]; do
             shift
             ;;
     esac
+
 done
 
 [[ -n "$DOMAIN" ]] || {
@@ -98,13 +143,18 @@ done
     exit 1
 }
 
-# Normalize input.
+########################################
+# NORMALIZE DOMAIN
+########################################
+
 DOMAIN="${DOMAIN#http://}"
 DOMAIN="${DOMAIN#https://}"
 DOMAIN="${DOMAIN%%/*}"
 
+TARGET="https://${DOMAIN}"
+
 ########################################
-# PATHS
+# OUTPUT
 ########################################
 
 TS=$(date +"%Y%m%d-%H%M%S")
@@ -117,9 +167,12 @@ PORTS="$BASE/ports"
 META="$BASE/meta"
 VULN="$BASE/vulns"
 WP="$BASE/wordpress"
+UPLOADS="$WP/uploads"
+SECURITY="$BASE/security"
 
 LOG="$BASE/run.log"
 JSON="$BASE/output.json"
+SUMMARY="$BASE/security-summary.txt"
 
 mkdir -p \
     "$SUB" \
@@ -127,7 +180,9 @@ mkdir -p \
     "$PORTS" \
     "$META" \
     "$VULN" \
-    "$WP"
+    "$WP" \
+    "$UPLOADS" \
+    "$SECURITY"
 
 ########################################
 # LOGGING
@@ -141,12 +196,8 @@ warn() {
     echo "[!] $*" | tee -a "$LOG"
 }
 
-fail() {
-    echo "[X] $*" | tee -a "$LOG"
-}
-
 ########################################
-# DEPENDENCY CHECK
+# DEPENDENCIES
 ########################################
 
 log "Checking dependencies..."
@@ -155,39 +206,56 @@ REQUIRED_COMMANDS=(
     curl
     jq
     dig
+    host
     whois
-    sed
     grep
+    sed
     awk
     sort
     tr
+    diff
 )
 
 for cmd in "${REQUIRED_COMMANDS[@]}"; do
-    if ! command -v "$cmd" &>/dev/null; then
+
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+
+        echo
         echo "Missing dependency: $cmd"
+        echo
+        echo "Install basic dependencies with:"
+        echo
+        echo "sudo apt install -y jq curl dnsutils whois"
+        echo
+
         exit 1
     fi
+
 done
 
 ########################################
-# TARGET URL
+# START
 ########################################
 
-TARGET="https://${DOMAIN}"
+log "========================================"
+log "GENLABS WORDPRESS SECURITY AUDIT"
+log "========================================"
 
 log "Target: $TARGET"
 log "Output: $BASE"
 
 ########################################
-# CT ENUMERATION
+# CERTIFICATE TRANSPARENCY
 ########################################
 
 log "Certificate Transparency enumeration..."
 
 CRT_JSON="$SUB/crt.json"
 
-if curl -fsSL \
+: > "$SUB/all.txt"
+
+if curl \
+    -fsSL \
     --max-time 30 \
     "https://crt.sh/?q=%25.${DOMAIN}&output=json" \
     -o "$CRT_JSON"; then
@@ -199,20 +267,23 @@ if curl -fsSL \
             sed 's/\*\.//g' |
             grep -E "^[A-Za-z0-9.-]+$" |
             grep -E "(^|\.)${DOMAIN//./\\.}$" |
-            sort -u > "$SUB/all.txt"
+            sort -u \
+            >> "$SUB/all.txt"
 
     else
+
         warn "crt.sh returned invalid JSON"
-        : > "$SUB/all.txt"
+
     fi
 
 else
+
     warn "Certificate Transparency lookup failed"
-    : > "$SUB/all.txt"
+
 fi
 
 ########################################
-# BRUTE SUBDOMAINS
+# SUBDOMAIN BRUTEFORCE
 ########################################
 
 log "Subdomain bruteforce..."
@@ -231,7 +302,9 @@ if [[ -f "$WORDLIST" ]]; then
     done < "$WORDLIST"
 
 else
+
     warn "Wordlist not found: $WORDLIST"
+
 fi
 
 ########################################
@@ -241,7 +314,8 @@ fi
 echo "$DOMAIN" >> "$SUB/all.txt"
 
 sed '/^[[:space:]]*$/d' "$SUB/all.txt" |
-    sort -u > "$SUB/all.tmp"
+    sort -u \
+    > "$SUB/all.tmp"
 
 mv "$SUB/all.tmp" "$SUB/all.txt"
 
@@ -257,7 +331,12 @@ log "Resolving hosts..."
 
 while IFS= read -r host; do
 
-    ip=$(dig +short "$host" A | grep -E '^[0-9.]+$' | head -n1 || true)
+    ip=$(
+        dig +short "$host" A |
+        grep -E '^[0-9.]+$' |
+        head -n1 ||
+        true
+    )
 
     if [[ -n "$ip" ]]; then
         echo "$host|$ip" >> "$SUB/alive.txt"
@@ -274,7 +353,8 @@ log "Alive hosts: $(wc -l < "$SUB/alive.txt")"
 ########################################
 
 cut -d'|' -f2 "$SUB/alive.txt" |
-    sort -u > "$META/ips.txt"
+    sort -u \
+    > "$META/ips.txt"
 
 ########################################
 # REVERSE DNS
@@ -288,14 +368,13 @@ while IFS= read -r ip; do
 
     result=$(dig -x "$ip" +short 2>/dev/null || true)
 
-    if [[ -n "$result" ]]; then
+    [[ -n "$result" ]] &&
         echo "$ip => $result" >> "$META/reverse.txt"
-    fi
 
 done < "$META/ips.txt"
 
 ########################################
-# WHOIS / ASN
+# ASN / WHOIS
 ########################################
 
 log "ASN / ownership information..."
@@ -306,8 +385,9 @@ while IFS= read -r ip; do
 
     whois "$ip" 2>/dev/null |
         grep -Ei \
-            'origin|originas|orgname|org-name|netname|descr|country' \
-        >> "$META/asn.txt" || true
+        'origin|originas|orgname|org-name|netname|descr|country' \
+        >> "$META/asn.txt" ||
+        true
 
 done < "$META/ips.txt"
 
@@ -317,8 +397,8 @@ done < "$META/ips.txt"
 
 log "HTTP probing..."
 
-: > "$META/panels.txt"
 : > "$META/http.txt"
+: > "$META/panels.txt"
 
 while IFS='|' read -r host ip; do
 
@@ -332,19 +412,26 @@ while IFS='|' read -r host ip; do
     curl \
         -k \
         -sS \
-        --max-time 15 \
+        --max-time "$CURL_TIMEOUT" \
         --max-filesize "$MAX_BODY_SIZE" \
         -A "Mozilla/5.0 (compatible; Genlabs-Security-Audit/1.0)" \
         -D "$header_file" \
         -o "$body_file" \
         "https://${host}/" \
-        2>>"$LOG" || true
+        2>>"$LOG" ||
+        true
 
     if [[ -f "$header_file" ]]; then
 
-        status=$(awk 'NR==1 {print $2}' "$header_file" 2>/dev/null || true)
+        status=$(
+            awk 'NR==1 {print $2}' \
+            "$header_file" \
+            2>/dev/null ||
+            true
+        )
 
-        echo "$host|$status|$ip" >> "$META/http.txt"
+        echo "$host|$status|$ip" \
+            >> "$META/http.txt"
 
     fi
 
@@ -354,16 +441,9 @@ while IFS='|' read -r host ip; do
             'wp-content|wp-includes|wp-json|woocommerce|elementor' \
             "$body_file"; then
 
-            echo "$host => probable WordPress" >> "$META/panels.txt"
-
-        fi
-
-        if grep -qiE \
-            '<title>.*(login|admin|dashboard|sign in).*<\/title>|wp-login|wp-admin' \
-            "$body_file"; then
-
-            echo "$host => possible admin/login panel" \
+            echo "$host => probable WordPress" \
                 >> "$META/panels.txt"
+
         fi
 
     fi
@@ -381,7 +461,7 @@ WP_DETECTED=false
 if curl \
     -k \
     -fsSL \
-    --max-time 15 \
+    --max-time "$CURL_TIMEOUT" \
     -o "$WP/home.html" \
     "$TARGET/"; then
 
@@ -393,12 +473,15 @@ if curl \
         log "WordPress detected."
 
     else
-        warn "WordPress could not be confirmed from homepage."
+
+        warn "WordPress could not be confirmed."
 
     fi
 
 else
-    warn "Unable to fetch WordPress homepage."
+
+    warn "Unable to fetch homepage."
+
 fi
 
 ########################################
@@ -407,22 +490,25 @@ fi
 
 log "Checking WordPress core version..."
 
-CORE_VERSION=""
+CORE_VERSION="unknown"
 
-# Try generator metadata first.
-CORE_VERSION=$(
-    grep -oiE \
-        '<meta[^>]+name=["'"'"']generator["'"'"'][^>]+content=["'"'"']WordPress [0-9.]+' \
-        "$WP/home.html" 2>/dev/null |
-    grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' |
-    head -n1 || true
-)
+if [[ -f "$WP/home.html" ]]; then
 
-echo "generator_version=${CORE_VERSION:-unknown}" \
-    > "$WP/core-version.txt"
+    CORE_VERSION=$(
+        grep -oiE \
+            '<meta[^>]+name=["'"'"']generator["'"'"'][^>]+content=["'"'"']WordPress [0-9.]+' \
+            "$WP/home.html" |
+        grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' |
+        head -n1 ||
+        true
+    )
+
+fi
+
+echo "$CORE_VERSION" > "$WP/core-version.txt"
 
 ########################################
-# WORDPRESS STANDARD ENDPOINTS
+# WP ENDPOINTS
 ########################################
 
 log "Checking WordPress endpoints..."
@@ -435,6 +521,7 @@ check_endpoint() {
     local path="$2"
 
     local status
+
     status=$(
         curl \
             -k \
@@ -443,10 +530,12 @@ check_endpoint() {
             -w "%{http_code}" \
             --max-time 10 \
             "${TARGET}${path}" \
-            2>/dev/null || echo "000"
+            2>/dev/null ||
+            echo "000"
     )
 
-    echo "$name|$path|$status" >> "$WP/endpoints.txt"
+    echo "$name|$path|$status" \
+        >> "$WP/endpoints.txt"
 
     log "WP endpoint: $path => $status"
 }
@@ -458,19 +547,20 @@ check_endpoint "xmlrpc" "/xmlrpc.php"
 check_endpoint "wp-cron" "/wp-cron.php"
 
 ########################################
-# SENSITIVE FILE CHECK
+# SENSITIVE FILES
 ########################################
 
-log "Checking common sensitive files..."
+log "Checking sensitive files..."
 
 : > "$WP/sensitive-files.txt"
 
-check_file() {
+check_sensitive() {
 
     local path="$1"
 
     local status
     local size
+    local type
 
     status=$(
         curl \
@@ -480,7 +570,8 @@ check_file() {
             -w "%{http_code}" \
             --max-time 10 \
             "${TARGET}${path}" \
-            2>/dev/null || echo "000"
+            2>/dev/null ||
+            echo "000"
     )
 
     size=$(
@@ -491,410 +582,66 @@ check_file() {
             -w "%{size_download}" \
             --max-time 10 \
             "${TARGET}${path}" \
-            2>/dev/null || echo "0"
+            2>/dev/null ||
+            echo "0"
     )
 
-    echo "$path|$status|$size" >> "$WP/sensitive-files.txt"
+    type=$(
+        curl \
+            -k \
+            -sS \
+            -o /dev/null \
+            -w "%{content_type}" \
+            --max-time 10 \
+            "${TARGET}${path}" \
+            2>/dev/null ||
+            echo "unknown"
+    )
 
-    if [[ "$status" == "200" ]]; then
-        warn "POTENTIALLY EXPOSED: $path => HTTP $status ($size bytes)"
-    fi
+    echo "$path|$status|$size|$type" \
+        >> "$WP/sensitive-files.txt"
+
+    case "$status" in
+
+        200|206)
+            warn "EXPOSED: $path => $status ($size bytes)"
+            ;;
+
+        403)
+            log "Protected: $path => 403"
+            ;;
+
+        404)
+            log "Not found: $path"
+            ;;
+
+        *)
+            log "Checked: $path => $status"
+            ;;
+
+    esac
 }
 
-check_file "/wp-config.php"
-check_file "/wp-config.php.bak"
-check_file "/wp-config.php.old"
-check_file "/wp-config.php.save"
-check_file "/.env"
-check_file "/.git/HEAD"
-check_file "/debug.log"
-check_file "/wp-content/debug.log"
-check_file "/wp-content/uploads/debug.log"
-check_file "/readme.html"
-check_file "/license.txt"
+check_sensitive "/wp-config.php"
+check_sensitive "/wp-config.php.bak"
+check_sensitive "/wp-config.php.old"
+check_sensitive "/wp-config.php.save"
+check_sensitive "/wp-config.php.swp"
+check_sensitive "/.env"
+check_sensitive "/.git/HEAD"
+check_sensitive "/debug.log"
+check_sensitive "/wp-content/debug.log"
+check_sensitive "/wp-content/uploads/debug.log"
 
 ########################################
-# UPLOADS DIRECTORY CHECK
+# NORMAL WORDPRESS PUBLIC FILES
 ########################################
 
-log "Checking /wp-content/uploads/ ..."
-
-UPLOADS="$WP/uploads"
-
-mkdir -p "$UPLOADS"
-
-UPLOADS_STATUS=$(
-    curl \
-        -k \
-        -sS \
-        -o "$UPLOADS/index.html" \
-        -w "%{http_code}" \
-        --max-time 15 \
-        "${TARGET}/wp-content/uploads/" \
-        2>/dev/null || echo "000"
-)
-
-echo "directory|$UPLOADS_STATUS" > "$UPLOADS/status.txt"
-
-log "Uploads directory => HTTP $UPLOADS_STATUS"
-
-########################################
-# DIRECTORY LISTING DETECTION
-########################################
-
-if [[ "$UPLOADS_STATUS" == "200" ]]; then
-
-    if grep -qiE \
-        'Index of /wp-content/uploads|Directory listing|Parent Directory' \
-        "$UPLOADS/index.html"; then
-
-        warn "DIRECTORY LISTING ENABLED: /wp-content/uploads/"
-        echo "DIRECTORY_LISTING=true" > "$UPLOADS/finding.txt"
-
-    else
-
-        echo "DIRECTORY_LISTING=false" > "$UPLOADS/finding.txt"
-        log "Uploads directory does not appear to expose an index listing."
-
-    fi
-fi
-
-########################################
-# UPLOADS FILE TESTS
-########################################
-
-log "Checking common dangerous/static file types in uploads..."
-
-: > "$UPLOADS/files.txt"
-
-UPLOAD_PATHS=(
-    "test.php"
-    "index.php"
-    "shell.php"
-    "cmd.php"
-    "test.phtml"
-    "test.phar"
-    "backup.zip"
-    "database.sql"
-    "debug.log"
-)
-
-for filename in "${UPLOAD_PATHS[@]}"; do
-
-    status=$(
-        curl \
-            -k \
-            -sS \
-            -o /dev/null \
-            -w "%{http_code}" \
-            --max-time 10 \
-            "${TARGET}/wp-content/uploads/${filename}" \
-            2>/dev/null || echo "000"
-    )
-
-    echo "$filename|$status" >> "$UPLOADS/files.txt"
-
-done
-
-########################################
-# FIND PHP REFERENCES IN UPLOADS HTML
-########################################
-
-if [[ -f "$UPLOADS/index.html" ]]; then
-
-    grep -oiE \
-        'href=["'\''][^"'\'']+\.(php|phtml|phar)(\?[^"'\'']*)?' \
-        "$UPLOADS/index.html" \
-        2>/dev/null |
-        sort -u > "$UPLOADS/php-references.txt" || true
-
-fi
-
-########################################
-# PHP FILE CANDIDATE CHECK
-########################################
-
-log "Checking common WordPress upload PHP locations..."
-
-: > "$UPLOADS/php-checks.txt"
-
-PHP_NAMES=(
-    "index.php"
-    "test.php"
-    "upload.php"
-    "image.php"
-    "ajax.php"
-    "shell.php"
-)
-
-for phpfile in "${PHP_NAMES[@]}"; do
-
-    result=$(
-        curl \
-            -k \
-            -sS \
-            -o /dev/null \
-            -w "%{http_code}|%{content_type}" \
-            --max-time 10 \
-            "${TARGET}/wp-content/uploads/${phpfile}" \
-            2>/dev/null || echo "000|unknown"
-    )
-
-    echo "$phpfile|$result" >> "$UPLOADS/php-checks.txt"
-
-done
-
-########################################
-# UPLOADS COMMON SENSITIVE EXTENSIONS
-########################################
-
-log "Checking publicly accessible upload artifacts..."
-
-: > "$UPLOADS/artifact-checks.txt"
-
-ARTIFACTS=(
-    ".zip"
-    ".tar.gz"
-    ".sql"
-    ".sql.gz"
-    ".bak"
-    ".old"
-    ".log"
-    ".env"
-    ".json"
-    ".csv"
-    ".xml"
-)
-
-for ext in "${ARTIFACTS[@]}"; do
-
-    echo "Extension ${ext}: requires filename discovery; no wildcard request performed." \
-        >> "$UPLOADS/artifact-checks.txt"
-
-done
-
-########################################
-# SECURITY HEADERS
-########################################
-
-log "Checking security headers..."
-
-curl \
-    -k \
-    -sS \
-    -D "$WP/security-headers.txt" \
-    -o /dev/null \
-    --max-time 15 \
-    "$TARGET/" \
-    2>/dev/null || true
-
-{
-    echo "Security header assessment"
-    echo "=========================="
-
-    for header in \
-        "strict-transport-security" \
-        "content-security-policy" \
-        "x-content-type-options" \
-        "x-frame-options" \
-        "referrer-policy" \
-        "permissions-policy"; do
-
-        if grep -qi "^${header}:" "$WP/security-headers.txt"; then
-            echo "[PRESENT] $header"
-        else
-            echo "[MISSING] $header"
-        fi
-
-    done
-
-} > "$WP/security-header-summary.txt"
-
-########################################
-# HTTP METHODS
-########################################
-
-log "Checking HTTP methods..."
-
-curl \
-    -k \
-    -sS \
-    -i \
-    -X OPTIONS \
-    --max-time 10 \
-    "$TARGET/" \
-    > "$WP/options.txt" \
-    2>/dev/null || true
-
-########################################
-# WORDPRESS REST API INFORMATION
-########################################
-
-log "Checking REST API exposure..."
-
-curl \
-    -k \
-    -fsSL \
-    --max-time 15 \
-    "${TARGET}/wp-json/" \
-    -o "$WP/wp-json.json" \
-    2>/dev/null || true
-
-if [[ -s "$WP/wp-json.json" ]]; then
-
-    if jq empty "$WP/wp-json.json" >/dev/null 2>&1; then
-
-        jq '{
-            name: .name,
-            description: .description,
-            url: .url,
-            home: .home,
-            namespaces: .namespaces
-        }' \
-        "$WP/wp-json.json" \
-        > "$WP/wp-json-summary.json" \
-        2>/dev/null || true
-
-    fi
-fi
-
-########################################
-# XML-RPC CHECK
-########################################
-
-log "Checking XML-RPC..."
-
-XMLRPC_HEADERS=$(
-    curl \
-        -k \
-        -sS \
-        -D - \
-        -o /dev/null \
-        --max-time 10 \
-        "${TARGET}/xmlrpc.php" \
-        2>/dev/null || true
-)
-
-printf '%s\n' "$XMLRPC_HEADERS" > "$WP/xmlrpc.txt"
-
-########################################
-# WPSCAN
-########################################
-
-if [[ "$ENABLE_WPSCAN" == true ]]; then
-
-    if command -v wpscan >/dev/null 2>&1; then
-
-        log "Running WPScan..."
-
-        WPSCAN_ARGS=(
-            "--url" "$TARGET"
-            "--enumerate" "ap,at,cb,dbe,u"
-            "--plugins-detection" "mixed"
-            "--format" "cli-no-color"
-            "--output" "$VULN/wpscan.txt"
-        )
-
-        if [[ -n "$WPSCAN_API_TOKEN" ]]; then
-
-            WPSCAN_ARGS+=(
-                "--api-token"
-                "$WPSCAN_API_TOKEN"
-            )
-
-        else
-
-            warn "WPSCAN_API_TOKEN not set. Vulnerability database results may be limited."
-
-        fi
-
-        wpscan "${WPSCAN_ARGS[@]}" \
-            >> "$LOG" 2>&1 || true
-
-    else
-
-        warn "WPScan not installed; skipping."
-
-    fi
-fi
-
-########################################
-# NUCLEI
-########################################
-
-if [[ "$ENABLE_NUCLEI" == true ]]; then
-
-    if command -v nuclei >/dev/null 2>&1; then
-
-        log "Running Nuclei WordPress-focused scan..."
-
-        cut -d'|' -f1 "$SUB/alive.txt" > "$SUB/hosts.txt"
-
-        nuclei \
-            -l "$SUB/hosts.txt" \
-            -tags wordpress,wp-plugin,wp-theme \
-            -severity info,low,medium,high,critical \
-            -rate-limit "$THREADS" \
-            -o "$VULN/nuclei-wordpress.txt" \
-            -silent \
-            >> "$LOG" 2>&1 || true
-
-    else
-
-        warn "Nuclei not installed; skipping."
-
-    fi
-fi
-
-########################################
-# OPTIONAL PORT SCAN
-########################################
-
-if [[ "$ENABLE_PORT_SCAN" == true ]]; then
-
-    if command -v nmap >/dev/null 2>&1; then
-
-        log "Running nmap top-1000 scan..."
-
-        while IFS='|' read -r host ip; do
-
-            safe_host=$(echo "$host" | tr -cd '[:alnum:]._-')
-
-            nmap \
-                -Pn \
-                --top-ports 1000 \
-                --open \
-                "$ip" \
-                -oN "$PORTS/${safe_host}.txt" \
-                >> "$LOG" 2>&1 || true
-
-        done < "$SUB/alive.txt"
-
-    else
-
-        warn "nmap not installed; skipping."
-
-    fi
-fi
-
-########################################
-# WORDPRESS PLUGIN FILE DISCOVERY
-########################################
-
-log "Checking common WordPress plugin/theme exposure..."
-
-: > "$WP/plugin-files.txt"
-
-COMMON_WP_FILES=(
-    "/wp-content/plugins/"
-    "/wp-content/themes/"
-    "/wp-content/uploads/"
-    "/wp-content/debug.log"
-    "/wp-includes/"
-    "/wp-admin/"
-)
-
-for path in "${COMMON_WP_FILES[@]}"; do
+: > "$WP/public-files.txt"
+
+for path in \
+    "/readme.html" \
+    "/license.txt"; do
 
     status=$(
         curl \
@@ -904,15 +651,350 @@ for path in "${COMMON_WP_FILES[@]}"; do
             -w "%{http_code}" \
             --max-time 10 \
             "${TARGET}${path}" \
-            2>/dev/null || echo "000"
+            2>/dev/null ||
+            echo "000"
     )
 
-    echo "$path|$status" >> "$WP/plugin-files.txt"
+    echo "$path|$status" >> "$WP/public-files.txt"
 
 done
 
 ########################################
-# WP USER ENUMERATION CHECK
+# UPLOAD DIRECTORY
+########################################
+
+log "Checking /wp-content/uploads/ ..."
+
+UPLOADS_STATUS=$(
+    curl \
+        -k \
+        -sS \
+        -o "$UPLOADS/index.html" \
+        -w "%{http_code}" \
+        --max-time "$CURL_TIMEOUT" \
+        "${TARGET}/wp-content/uploads/" \
+        2>/dev/null ||
+        echo "000"
+)
+
+echo "directory|$UPLOADS_STATUS" \
+    > "$UPLOADS/status.txt"
+
+log "Uploads directory => HTTP $UPLOADS_STATUS"
+
+########################################
+# DIRECTORY LISTING
+########################################
+
+DIRECTORY_LISTING=false
+
+if [[ "$UPLOADS_STATUS" == "200" ]]; then
+
+    if grep -qiE \
+        'Index of /wp-content/uploads|Directory listing|Parent Directory' \
+        "$UPLOADS/index.html"; then
+
+        DIRECTORY_LISTING=true
+
+        warn "DIRECTORY LISTING ENABLED"
+
+    fi
+
+fi
+
+echo "DIRECTORY_LISTING=$DIRECTORY_LISTING" \
+    > "$UPLOADS/finding.txt"
+
+########################################
+# EXTRACT VISIBLE UPLOAD FILES
+########################################
+
+log "Extracting files visible in uploads listing..."
+
+: > "$UPLOADS/listed-files.txt"
+
+if [[ "$DIRECTORY_LISTING" == true ]]; then
+
+    grep -oiE \
+        'href=["'"'"'][^"'"'"']+["'"'"']' \
+        "$UPLOADS/index.html" |
+    sed -E 's/^href=["'"'"']//' |
+    sed -E 's/["'"'"']$//' |
+    grep -vE '^(\.\.?|/)' |
+    sort -u \
+    > "$UPLOADS/listed-files.txt" ||
+    true
+
+fi
+
+########################################
+# CLASSIFY LISTED FILES
+########################################
+
+log "Classifying exposed upload files..."
+
+: > "$UPLOADS/findings.txt"
+
+while IFS= read -r file; do
+
+    [[ -z "$file" ]] && continue
+
+    case "$file" in
+
+        *.php|*.php[0-9]|*.phtml|*.phar|*.inc)
+            echo "CRITICAL_CANDIDATE|$file" \
+                >> "$UPLOADS/findings.txt"
+            ;;
+
+        *.sql|*.sql.gz|*.zip|*.tar|*.tar.gz|*.tgz|*.bak|*.backup|*.old)
+            echo "HIGH_SENSITIVITY|$file" \
+                >> "$UPLOADS/findings.txt"
+            ;;
+
+        *.log|*.txt|*.json|*.csv|*.xml)
+            echo "POTENTIAL_DATA_EXPOSURE|$file" \
+                >> "$UPLOADS/findings.txt"
+            ;;
+
+        .env|*.env)
+            echo "CRITICAL_CANDIDATE|$file" \
+                >> "$UPLOADS/findings.txt"
+            ;;
+
+        *)
+            echo "NORMAL|$file" \
+                >> "$UPLOADS/findings.txt"
+            ;;
+
+    esac
+
+done < "$UPLOADS/listed-files.txt"
+
+########################################
+# VERIFY INTERESTING UPLOAD FILES
+########################################
+
+log "Verifying interesting files..."
+
+: > "$UPLOADS/verified-files.txt"
+
+while IFS='|' read -r classification file; do
+
+    [[ -z "$file" ]] && continue
+
+    # Avoid external URLs.
+    [[ "$file" =~ ^https?:// ]] && continue
+
+    file="${file#/}"
+
+    url="${TARGET}/wp-content/uploads/${file}"
+
+    status=$(
+        curl \
+            -k \
+            -sS \
+            -o /dev/null \
+            -w "%{http_code}" \
+            --max-time 10 \
+            "$url" \
+            2>/dev/null ||
+            echo "000"
+    )
+
+    content_type=$(
+        curl \
+            -k \
+            -sS \
+            -o /dev/null \
+            -w "%{content_type}" \
+            --max-time 10 \
+            "$url" \
+            2>/dev/null ||
+            echo "unknown"
+    )
+
+    echo "$classification|$file|$status|$content_type" \
+        >> "$UPLOADS/verified-files.txt"
+
+    if [[ "$status" == "200" || "$status" == "206" ]]; then
+
+        case "$classification" in
+
+            CRITICAL_CANDIDATE)
+                warn "CRITICAL CANDIDATE EXPOSED: $file"
+                ;;
+
+            HIGH_SENSITIVITY)
+                warn "HIGH-SENSITIVITY FILE EXPOSED: $file"
+                ;;
+
+            POTENTIAL_DATA_EXPOSURE)
+                warn "POTENTIAL DATA EXPOSURE: $file"
+                ;;
+
+        esac
+
+    fi
+
+done < "$UPLOADS/findings.txt"
+
+########################################
+# PHP CANDIDATE DISCOVERY
+########################################
+
+log "Checking common PHP locations..."
+
+: > "$UPLOADS/php-checks.txt"
+
+PHP_NAMES=(
+    "index.php"
+    "test.php"
+    "upload.php"
+    "image.php"
+    "ajax.php"
+    "security-canary.php"
+)
+
+for phpfile in "${PHP_NAMES[@]}"; do
+
+    result=$(
+        curl \
+            -k \
+            -sS \
+            -o /dev/null \
+            -w "%{http_code}|%{content_type}|%{size_download}" \
+            --max-time 10 \
+            "${TARGET}/wp-content/uploads/${phpfile}" \
+            2>/dev/null ||
+            echo "000|unknown|0"
+    )
+
+    echo "$phpfile|$result" \
+        >> "$UPLOADS/php-checks.txt"
+
+done
+
+########################################
+# PHP EXECUTION CANARY
+########################################
+
+log "PHP execution canary..."
+
+CANARY_RESULT="NOT_TESTED"
+
+if [[ -n "$PHP_CANARY_URL" ]]; then
+
+    if [[ "$PHP_CANARY_URL" != /* ]]; then
+        warn "PHP canary path must start with /"
+    else
+
+        CANARY_URL="${TARGET}${PHP_CANARY_URL}"
+
+        CANARY_BODY="$UPLOADS/php-canary-response.txt"
+        CANARY_HEADERS="$UPLOADS/php-canary-headers.txt"
+
+        curl \
+            -k \
+            -sS \
+            --max-time 10 \
+            -D "$CANARY_HEADERS" \
+            -o "$CANARY_BODY" \
+            "$CANARY_URL" \
+            2>/dev/null ||
+            true
+
+        CANARY_STATUS=$(
+            awk '
+                $1 ~ /^HTTP\// {
+                    status=$2
+                }
+                END {
+                    print status
+                }
+            ' "$CANARY_HEADERS" 2>/dev/null ||
+            echo "000"
+        )
+
+        if grep -qE 'GENLABS_PHP_CANARY_OK' "$CANARY_BODY"; then
+
+            CANARY_RESULT="PHP_EXECUTED"
+
+            warn "!!! PHP EXECUTION CONFIRMED !!!"
+            warn "$CANARY_URL"
+
+        elif [[ "$CANARY_STATUS" == "200" ]]; then
+
+            CANARY_RESULT="HTTP_200_BUT_CANARY_NOT_EXECUTED"
+
+            warn "Canary returned HTTP 200 but marker was not observed."
+
+        elif [[ "$CANARY_STATUS" == "403" ]]; then
+
+            CANARY_RESULT="BLOCKED_403"
+
+            log "PHP canary blocked with HTTP 403."
+
+        elif [[ "$CANARY_STATUS" == "404" ]]; then
+
+            CANARY_RESULT="NOT_FOUND"
+
+            log "PHP canary not found."
+
+        else
+
+            CANARY_RESULT="HTTP_${CANARY_STATUS}"
+
+        fi
+
+        echo "$CANARY_RESULT" \
+            > "$UPLOADS/php-canary-result.txt"
+
+    fi
+
+else
+
+    echo "NOT_TESTED" \
+        > "$UPLOADS/php-canary-result.txt"
+
+    log "PHP canary not configured."
+    log "Use --php-canary-url for an explicit execution test."
+
+fi
+
+########################################
+# REST API
+########################################
+
+log "Checking REST API..."
+
+curl \
+    -k \
+    -fsSL \
+    --max-time "$CURL_TIMEOUT" \
+    "${TARGET}/wp-json/" \
+    -o "$WP/wp-json.json" \
+    2>/dev/null ||
+    true
+
+if [[ -s "$WP/wp-json.json" ]] &&
+   jq empty "$WP/wp-json.json" >/dev/null 2>&1; then
+
+    jq '{
+        name: .name,
+        description: .description,
+        url: .url,
+        home: .home,
+        namespaces: .namespaces
+    }' \
+    "$WP/wp-json.json" \
+    > "$WP/wp-json-summary.json" \
+    2>/dev/null ||
+    true
+
+fi
+
+########################################
+# REST USER ENUMERATION
 ########################################
 
 log "Checking REST user endpoint..."
@@ -925,14 +1007,17 @@ USER_STATUS=$(
         -w "%{http_code}" \
         --max-time 10 \
         "${TARGET}/wp-json/wp/v2/users?per_page=5" \
-        2>/dev/null || echo "000"
+        2>/dev/null ||
+        echo "000"
 )
 
-echo "$USER_STATUS" > "$WP/user-endpoint-status.txt"
+echo "$USER_STATUS" \
+    > "$WP/user-endpoint-status.txt"
 
 if [[ "$USER_STATUS" == "200" ]]; then
 
-    warn "REST API user endpoint returned HTTP 200."
+    warn "REST user endpoint returned HTTP 200."
+
     echo "USER_ENDPOINT_ACCESSIBLE=true" \
         > "$WP/user-endpoint-finding.txt"
 
@@ -944,165 +1029,372 @@ else
 fi
 
 ########################################
-# JSON OUTPUT
+# XML-RPC
+########################################
+
+log "Checking XML-RPC..."
+
+curl \
+    -k \
+    -sS \
+    -D "$WP/xmlrpc.txt" \
+    -o /dev/null \
+    --max-time 10 \
+    "${TARGET}/xmlrpc.php" \
+    2>/dev/null ||
+    true
+
+########################################
+# SECURITY HEADERS
+########################################
+
+log "Checking security headers..."
+
+curl \
+    -k \
+    -sS \
+    -D "$SECURITY/headers.txt" \
+    -o /dev/null \
+    --max-time "$CURL_TIMEOUT" \
+    "$TARGET/" \
+    2>/dev/null ||
+    true
+
+: > "$SECURITY/header-summary.txt"
+
+for header in \
+    strict-transport-security \
+    content-security-policy \
+    x-content-type-options \
+    x-frame-options \
+    referrer-policy \
+    permissions-policy; do
+
+    if grep -qi "^${header}:" "$SECURITY/headers.txt"; then
+
+        echo "[PRESENT] $header" \
+            >> "$SECURITY/header-summary.txt"
+
+    else
+
+        echo "[MISSING] $header" \
+            >> "$SECURITY/header-summary.txt"
+
+    fi
+
+done
+
+########################################
+# HTTP OPTIONS
+########################################
+
+log "Checking HTTP methods..."
+
+curl \
+    -k \
+    -sS \
+    -i \
+    -X OPTIONS \
+    --max-time 10 \
+    "$TARGET/" \
+    > "$SECURITY/options.txt" \
+    2>/dev/null ||
+    true
+
+########################################
+# WORDPRESS COMMON DIRECTORIES
+########################################
+
+log "Checking WordPress directories..."
+
+: > "$WP/directories.txt"
+
+for path in \
+    "/wp-admin/" \
+    "/wp-includes/" \
+    "/wp-content/" \
+    "/wp-content/plugins/" \
+    "/wp-content/themes/" \
+    "/wp-content/uploads/"; do
+
+    status=$(
+        curl \
+            -k \
+            -sS \
+            -o /dev/null \
+            -w "%{http_code}" \
+            --max-time 10 \
+            "${TARGET}${path}" \
+            2>/dev/null ||
+            echo "000"
+    )
+
+    echo "$path|$status" \
+        >> "$WP/directories.txt"
+
+done
+
+########################################
+# ROBOTS / SITEMAP
+########################################
+
+log "Checking robots.txt and sitemap..."
+
+for path in \
+    "/robots.txt" \
+    "/sitemap.xml" \
+    "/wp-sitemap.xml"; do
+
+    status=$(
+        curl \
+            -k \
+            -sS \
+            -o /dev/null \
+            -w "%{http_code}" \
+            --max-time 10 \
+            "${TARGET}${path}" \
+            2>/dev/null ||
+            echo "000"
+    )
+
+    echo "$path|$status" \
+        >> "$WP/public-endpoints.txt"
+
+done
+
+########################################
+# NUCLEI
+########################################
+
+if [[ "$ENABLE_NUCLEI" == true ]]; then
+
+    if command -v nuclei >/dev/null 2>&1; then
+
+        log "Running Nuclei..."
+
+        cut -d'|' -f1 "$SUB/alive.txt" \
+            > "$SUB/hosts.txt"
+
+        nuclei \
+            -l "$SUB/hosts.txt" \
+            -severity info,low,medium,high,critical \
+            -rate-limit "$THREADS" \
+            -o "$VULN/nuclei.txt" \
+            -silent \
+            >> "$LOG" 2>&1 ||
+            true
+
+    else
+
+        warn "Nuclei not installed; skipping."
+
+    fi
+
+fi
+
+########################################
+# PORT SCAN
+########################################
+
+if [[ "$ENABLE_PORT_SCAN" == true ]]; then
+
+    if command -v nmap >/dev/null 2>&1; then
+
+        log "Running nmap..."
+
+        while IFS='|' read -r host ip; do
+
+            safe_host=$(echo "$host" | tr -cd '[:alnum:]._-')
+
+            nmap \
+                -Pn \
+                --top-ports 1000 \
+                --open \
+                "$ip" \
+                -oN "$PORTS/${safe_host}.txt" \
+                >> "$LOG" 2>&1 ||
+                true
+
+        done < "$SUB/alive.txt"
+
+    else
+
+        warn "nmap not installed; skipping."
+
+    fi
+
+fi
+
+########################################
+# FINDINGS
+########################################
+
+log "Building findings..."
+
+: > "$SECURITY/findings.txt"
+
+if [[ "$DIRECTORY_LISTING" == true ]]; then
+
+    echo "HIGH|Directory listing enabled on /wp-content/uploads/" \
+        >> "$SECURITY/findings.txt"
+
+fi
+
+if grep -Eq '^CRITICAL_CANDIDATE\|.*\|(200|206)\|' \
+    "$UPLOADS/verified-files.txt" 2>/dev/null; then
+
+    echo "CRITICAL|Executable/sensitive candidate exposed in uploads" \
+        >> "$SECURITY/findings.txt"
+
+fi
+
+if grep -Eq '^HIGH_SENSITIVITY\|.*\|(200|206)\|' \
+    "$UPLOADS/verified-files.txt" 2>/dev/null; then
+
+    echo "HIGH|Backup/database/archive exposed in uploads" \
+        >> "$SECURITY/findings.txt"
+
+fi
+
+if [[ "$CANARY_RESULT" == "PHP_EXECUTED" ]]; then
+
+    echo "CRITICAL|PHP execution confirmed in tested upload location" \
+        >> "$SECURITY/findings.txt"
+
+fi
+
+if [[ "$USER_STATUS" == "200" ]]; then
+
+    echo "LOW|REST API user enumeration accessible" \
+        >> "$SECURITY/findings.txt"
+
+fi
+
+########################################
+# JSON
 ########################################
 
 log "Generating JSON..."
 
 SUBS_JSON=$(
     jq -R -s '
-        split("\n")
-        | map(select(length > 0))
+        split("\n") |
+        map(select(length > 0))
     ' "$SUB/all.txt"
 )
 
 IPS_JSON=$(
     jq -R -s '
-        split("\n")
-        | map(select(length > 0))
+        split("\n") |
+        map(select(length > 0))
     ' "$META/ips.txt"
 )
 
-UPLOAD_STATUS_JSON=$(
-    jq -R -s '
-        split("\n")
-        | map(select(length > 0))
-    ' "$UPLOADS/status.txt"
-)
-
-WP_DETECTED_JSON="false"
+WP_JSON=false
 
 if [[ "$WP_DETECTED" == true ]]; then
-    WP_DETECTED_JSON="true"
+    WP_JSON=true
 fi
 
 jq -n \
     --arg domain "$DOMAIN" \
     --arg target "$TARGET" \
     --arg timestamp "$TS" \
-    --argjson wordpress "$WP_DETECTED_JSON" \
+    --arg core_version "$CORE_VERSION" \
+    --arg canary "$CANARY_RESULT" \
+    --argjson wordpress "$WP_JSON" \
     --argjson subdomains "$SUBS_JSON" \
     --argjson ips "$IPS_JSON" \
-    --argjson uploads "$UPLOAD_STATUS_JSON" \
     '{
         domain: $domain,
         target: $target,
         timestamp: $timestamp,
 
         wordpress_detected: $wordpress,
+        wordpress_core_version: $core_version,
+
+        php_upload_canary: $canary,
 
         subdomains: $subdomains,
-        ips: $ips,
-
-        wordpress_checks: {
-            uploads: $uploads
-        }
-    }' > "$JSON"
+        ips: $ips
+    }' \
+    > "$JSON"
 
 ########################################
-# SIMPLE FINDINGS SUMMARY
+# SECURITY SUMMARY
 ########################################
-
-SUMMARY="$BASE/security-summary.txt"
 
 {
-    echo "========================================"
+    echo "=============================================="
     echo " GENLABS WORDPRESS SECURITY AUDIT"
-    echo "========================================"
+    echo "=============================================="
     echo
     echo "Target: $TARGET"
     echo "Date:   $(date)"
     echo
-    echo "========================================"
-    echo " WORDPRESS"
-    echo "========================================"
+    echo "WordPress detected: $WP_DETECTED"
+    echo "Core version:       $CORE_VERSION"
     echo
-
-    if [[ "$WP_DETECTED" == true ]]; then
-        echo "[+] WordPress detected"
-    else
-        echo "[?] WordPress not confirmed"
-    fi
-
-    echo
-    echo "========================================"
+    echo "=============================================="
     echo " UPLOADS"
-    echo "========================================"
+    echo "=============================================="
+    echo
+    echo "Directory HTTP:      $UPLOADS_STATUS"
+    echo "Directory listing:   $DIRECTORY_LISTING"
+    echo "PHP canary:          $CANARY_RESULT"
     echo
 
-    if [[ "$UPLOADS_STATUS" == "200" ]]; then
-        echo "[!] /wp-content/uploads/ returned HTTP 200"
-        echo "    Review uploads/index.html"
-    elif [[ "$UPLOADS_STATUS" == "403" ]]; then
-        echo "[+] /wp-content/uploads/ returned HTTP 403"
-    elif [[ "$UPLOADS_STATUS" == "404" ]]; then
-        echo "[+] /wp-content/uploads/ returned HTTP 404"
+    if [[ -s "$UPLOADS/verified-files.txt" ]]; then
+
+        echo "Verified interesting files:"
+        cat "$UPLOADS/verified-files.txt"
+
     else
-        echo "[?] /wp-content/uploads/ returned HTTP $UPLOADS_STATUS"
+
+        echo "No interesting files discovered."
+
     fi
 
     echo
-    echo "========================================"
+    echo "=============================================="
     echo " SENSITIVE FILES"
-    echo "========================================"
+    echo "=============================================="
     echo
 
-    if grep -qE '\|200\|' "$WP/sensitive-files.txt"; then
-        echo "[!] Possible publicly accessible sensitive file(s):"
-        grep -E '\|200\|' "$WP/sensitive-files.txt"
+    grep -E '\|(200|206)\|' \
+        "$WP/sensitive-files.txt" ||
+        echo "No tested sensitive files returned 200/206."
+
+    echo
+    echo "=============================================="
+    echo " REST API"
+    echo "=============================================="
+    echo
+    echo "User endpoint: $USER_STATUS"
+    echo
+
+    echo "=============================================="
+    echo " FINDINGS"
+    echo "=============================================="
+    echo
+
+    if [[ -s "$SECURITY/findings.txt" ]]; then
+        cat "$SECURITY/findings.txt"
     else
-        echo "[+] No tested sensitive file returned HTTP 200"
+        echo "No automated findings."
     fi
 
     echo
-    echo "========================================"
-    echo " UPLOAD PHP CHECK"
-    echo "========================================"
-    echo
-
-    if grep -Eq '\|(200|206)\|' "$UPLOADS/php-checks.txt"; then
-        echo "[!] PHP candidate returned successful HTTP response:"
-        grep -E '\|(200|206)\|' "$UPLOADS/php-checks.txt"
-    else
-        echo "[+] No tested PHP candidate returned HTTP 200/206"
-    fi
-
-    echo
-    echo "========================================"
-    echo " USER ENUMERATION"
-    echo "========================================"
-    echo
-
-    if [[ "$USER_STATUS" == "200" ]]; then
-        echo "[!] REST user endpoint returned HTTP 200"
-    else
-        echo "[+] REST user endpoint did not return HTTP 200"
-    fi
-
-    echo
-    echo "========================================"
-    echo " SCANNERS"
-    echo "========================================"
-    echo
-
-    [[ -f "$VULN/wpscan.txt" ]] &&
-        echo "[+] WPScan completed"
-
-    [[ -f "$VULN/nuclei-wordpress.txt" ]] &&
-        echo "[+] Nuclei completed"
-
-    echo
-    echo "========================================"
+    echo "=============================================="
     echo " OUTPUT"
-    echo "========================================"
+    echo "=============================================="
     echo
     echo "$BASE"
-    echo
 
 } > "$SUMMARY"
 
 ########################################
-# DIFF SCAN
+# DIFF
 ########################################
 
 PREV=$(
@@ -1116,19 +1408,21 @@ PREV=$(
     awk 'NR==2 {$1=""; sub(/^ /,""); print}'
 )
 
-if [[ -n "${PREV:-}" && -f "$PREV/subdomains/all.txt" ]]; then
+if [[ -n "${PREV:-}" &&
+      -f "$PREV/subdomains/all.txt" ]]; then
 
     log "Comparing with previous scan..."
 
     diff \
         "$PREV/subdomains/all.txt" \
         "$SUB/all.txt" \
-        > "$BASE/diff.txt" || true
+        > "$BASE/diff.txt" ||
+        true
 
 fi
 
 ########################################
-# FINAL OUTPUT
+# COMPLETE
 ########################################
 
 log "========================================"
@@ -1139,19 +1433,19 @@ echo
 echo "Target:"
 echo "  $TARGET"
 echo
-echo "Results:"
-echo "  $BASE"
-echo
-echo "Security summary:"
+echo "Summary:"
 echo "  $SUMMARY"
-echo
-echo "Nuclei:"
-echo "  $VULN/nuclei-wordpress.txt"
 echo
 echo "Uploads:"
 echo "  $UPLOADS/"
 echo
+echo "Findings:"
+echo "  $SECURITY/findings.txt"
+echo
 echo "JSON:"
 echo "  $JSON"
 echo
-echo "🔥 WordPress security audit completed."
+echo "Nuclei:"
+echo "  $VULN/nuclei.txt"
+echo
+echo "🔥 Security audit completed."
