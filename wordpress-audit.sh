@@ -9,7 +9,6 @@ set -euo pipefail
 DOMAIN=""
 ENABLE_PORT_SCAN=false
 ENABLE_NUCLEI=true
-ENABLE_WPSCAN=true
 
 THREADS=20
 WORDLIST="/usr/share/wordlists/subdomains.txt"
@@ -37,7 +36,6 @@ Example:
 Options:
   --ports        Run nmap top-1000 port scan
   --no-nuclei    Disable nuclei
-  --no-wpscan    Disable WPScan
   --wordlist     Subdomain wordlist
 
 Examples:
@@ -58,11 +56,6 @@ while [[ "$#" -gt 0 ]]; do
 
         --no-nuclei)
             ENABLE_NUCLEI=false
-            shift
-            ;;
-
-        --no-wpscan)
-            ENABLE_WPSCAN=false
             shift
             ;;
 
