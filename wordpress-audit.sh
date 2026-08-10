@@ -1145,9 +1145,6 @@ echo
 echo "Security summary:"
 echo "  $SUMMARY"
 echo
-echo "WPScan:"
-echo "  $VULN/wpscan.txt"
-echo
 echo "Nuclei:"
 echo "  $VULN/nuclei-wordpress.txt"
 echo
